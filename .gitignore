@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.env
+output/
+workspace/
+.DS_Store
+test/

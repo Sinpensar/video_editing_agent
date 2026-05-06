@@ -1,0 +1,123 @@
+import subprocess
+import whisper
+import json
+import sys
+import os
+
+
+def extract_audio(video_path, audio_path="temp_audio.wav"):
+    """
+    Step 1: Extract audio from video using FFmpeg
+    Whisper only needs audio, not video frames.
+    Processing audio alone is faster and more stable.
+    """
+    print("Extracting audio from video...")
+
+    command = [
+        "ffmpeg",
+        "-i", video_path,       # input video
+        "-vn",                   # no video (audio only)
+        "-acodec", "pcm_s16le",  # audio codec
+        "-ar", "16000",          # sample rate 16kHz (recommended by Whisper)
+        "-ac", "1",              # mono channel
+        "-y",                    # overwrite existing file
+        audio_path               # output audio file
+    ]
+
+    result = subprocess.run(command, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Failed to extract audio: {result.stderr}")
+        return None
+
+    print(f"Audio extracted: {audio_path}")
+    return audio_path
+
+
+def transcribe_audio(audio_path):
+    """
+    Step 2: Transcribe audio to text using Whisper
+    
+    Whisper returns for each sentence:
+    - start time
+    - end time
+    - spoken content
+    """
+    print("Loading Whisper model...")
+    model = whisper.load_model("base")
+    # base model ~150MB, fast
+    # switch to small or medium for better accuracy
+
+    print("Transcribing speech, please wait...")
+    result = model.transcribe(audio_path, language=None)
+    # language=None lets Whisper auto-detect the language
+
+    return result
+
+
+def format_time(seconds):
+    """Convert seconds to min:sec format for readability"""
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins}:{secs:02d}"
+
+
+def process_video(video_path):
+    """Full pipeline: extract audio -> transcribe -> save results"""
+
+    # check file exists
+    if not os.path.exists(video_path):
+        print(f"File not found: {video_path}")
+        return
+
+    # step 1: extract audio
+    audio_path = extract_audio(video_path)
+    if not audio_path:
+        return
+
+    # step 2: transcribe
+    result = transcribe_audio(audio_path)
+
+    language = result.get("language", "unknown")
+    segments = []
+
+    for seg in result["segments"]:
+        segments.append({
+            "id": seg["id"],
+            "start": round(seg["start"], 2),
+            "end": round(seg["end"], 2),
+            "text": seg["text"].strip()
+        })
+
+    # print results
+    print(f"\n{'='*50}")
+    print(f"Done! Language: {language}, Total segments: {len(segments)}")
+    print(f"{'='*50}\n")
+
+    for seg in segments:
+        start = format_time(seg["start"])
+        end = format_time(seg["end"])
+        print(f"[{start} - {end}] {seg['text']}")
+
+    # save to JSON
+    output = {
+        "video": video_path,
+        "language": language,
+        "segments": segments
+    }
+
+    with open("transcription.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    print(f"\nResults saved to transcription.json")
+
+    # clean up temp audio file
+    os.remove(audio_path)
+    print("Temp audio file cleaned up")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python3 step1_transcribe.py your_video.mp4")
+    else:
+        process_video(sys.argv[1])
