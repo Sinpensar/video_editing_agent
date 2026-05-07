@@ -38,8 +38,10 @@ cp .env.example .env
 
 ```bash
 python main.py
-# or pre-load some footage so the agent already knows about it:
+# pre-load specific clips:
 python main.py ~/Movies/raw/clip1.mp4 ~/Movies/raw/clip2.mp4
+# or point at a folder to bulk-load every video inside it:
+python main.py ~/Movies/trip_japan/
 ```
 
 Once you're in, just chat. For example:
@@ -56,12 +58,29 @@ agent ▸ Picked 6 clips of step-by-step cooking, total length 1:58.
 
 You can iterate freely: "shorter", "drop clip 3", "keep more of the seasoning part" — the agent recomputes the cut and renders a new file.
 
+### Multi-video mode
+
+Once you've loaded 10+ clips, the agent shifts strategy: for each video it sees a short *snippet* (head + tail of the transcript) injected into its system prompt, so it can scan the whole library at a glance without reading every transcript. For theme-based goals it reaches for `search_segments` ("find every mention of coffee across all clips") instead of pulling full transcripts. Default clip ordering in the final cut is by source filename, which matches capture-time naming for most cameras and phones — say "order by topic" or "best moment first" if you want something else.
+
+```
+you ▸ I dropped 23 trip clips into ~/Movies/trip_japan. Make me a 3-minute highlight focused on food.
+  ✓ list_videos() → [23 entries]
+  ✓ search_segments(query=food) → 41 matches across 14 videos
+  ✓ get_transcript(video_id=v07) → {...}
+  ✓ get_transcript(video_id=v12) → {...}
+  ✓ create_cut(clips=[18 clips]) → output/japan_food_xxx.mp4
+
+agent ▸ Built a 3:02 cut from 18 food moments across 14 of your 23 clips.
+        Ordered by capture day (filename ascending). Output: output/japan_food_xxx.mp4
+```
+
 ### Built-in slash commands
 
 | Command | What it does |
 |---------|--------------|
-| `/add <path>` | Register a video directly (you can also just tell the agent in chat) |
-| `/list` | List the videos currently registered |
+| `/add <path>` | Register a single video |
+| `/add_dir <path>` | Bulk-register every video file inside a folder (top-level only) |
+| `/list` | List the videos currently registered (with snippets) |
 | `/reset` | Clear conversation history (keeps loaded videos) |
 | `/quit` | Exit |
 | `/help` | Show help |
@@ -74,10 +93,30 @@ vlog_agent/
 ├── agent.py         # VlogAgent + LLM function-calling loop
 ├── transcribe.py    # Whisper transcription (with file-fingerprint cache)
 ├── editor.py        # FFmpeg cut + concat
+├── tracing.py       # Tracer — dumps every conversation turn to JSON
+├── viewer.py        # Builds a self-contained HTML viewer for traces
 ├── workspace/       # Transcript cache (auto-created)
 ├── output/          # Finished cuts (auto-created)
+├── traces/          # Conversation traces (auto-created, one folder per session)
 └── requirements.txt
 ```
+
+## Inspecting what the agent did
+
+Every chat session writes a structured JSON file per turn under
+`traces/<session_id>/turn_NNN.json`. Each turn captures the user input,
+every LLM API call (with token counts and latency), every tool call
+(with arguments, result, duration), and the final assistant reply.
+
+To browse them, build the static viewer:
+
+```bash
+python viewer.py --open
+```
+
+This writes `traces/viewer.html` and opens it in your browser. No server
+needed — the data is inlined into the HTML and works from `file://`.
+Re-run after each session to refresh.
 
 ## Workflow
 
@@ -87,10 +126,11 @@ user chat
    ▼
 VlogAgent ──► LLM (decides which tools to call)
    │             │
-   │             ├─► add_video      → transcribe.py → Whisper
-   │             ├─► get_transcript → cache
-   │             ├─► list_videos    → project state
-   │             └─► create_cut     → editor.py    → FFmpeg
+   │             ├─► add_video / add_videos_from_dir → transcribe.py → Whisper
+   │             ├─► get_transcript                  → cache
+   │             ├─► search_segments                 → substring match across all
+   │             ├─► list_videos                     → project state + snippets
+   │             └─► create_cut                      → editor.py    → FFmpeg
    │
    ▼
 output/*.mp4 + a natural-language summary
@@ -114,5 +154,6 @@ output/*.mp4 + a natural-language summary
 ## Known limitations (room for v2)
 
 - No transitions, BGM, or burned-in subtitles yet.
-- Multi-video order follows what the user tells the agent — there's no auto-merge by file metadata or timestamps.
+- `search_segments` is plain case-insensitive substring — no fuzzy / semantic search yet.
+- When source clips have different resolutions, the concatenated output keeps the per-clip resolution rather than normalizing to a single canvas. Most players handle it, some don't.
 - CLI only, no GUI.

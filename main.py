@@ -13,16 +13,18 @@ import os
 import sys
 from pathlib import Path
 
-from agent import VlogAgent
+from agent import VlogAgent, DEFAULT_MODEL, DEFAULT_BASE_URL
+from tracing import Tracer
 
 
 HELP = """\
 Commands (anything else is sent to the agent as chat):
-  /add <path>      register a video (you can also just tell the agent in chat)
-  /list            list registered videos
-  /reset           clear conversation history (keeps loaded videos)
-  /quit, /exit     leave
-  /help            show this help
+  /add <path>          register a single video
+  /add_dir <path>      bulk-register every video in a folder (top-level only)
+  /list                list registered videos
+  /reset               clear conversation history (keeps loaded videos)
+  /quit, /exit         leave
+  /help                show this help
 """
 
 BANNER = r"""
@@ -60,26 +62,43 @@ def main() -> None:
         sys.exit(1)
 
     print(BANNER)
+    tracer = Tracer(model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL)
+    print(f"  trace session: {tracer.session_id} → traces/{tracer.session_id}/\n")
+
     try:
-        agent = VlogAgent()
+        agent = VlogAgent(tracer=tracer)
     except RuntimeError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
 
-    # Pre-load any positional args as videos
+    # Pre-load any positional args as videos. A directory means bulk-load.
+    def _prog(i, total, name, res):
+        tag = "⚠" if "error" in res else "✓"
+        print(f"  [{i}/{total}] {tag} {name}")
+
     for arg in sys.argv[1:]:
         p = Path(arg).expanduser()
         if not p.exists():
             print(f"(skipping non-existent: {p})")
             continue
-        print(f"Pre-loading {p.name}...")
-        result = agent.project.add(str(p))
-        if "error" in result:
-            print(f"  ⚠ {result['error']}")
+        if p.is_dir():
+            print(f"Pre-loading folder {p}...")
+            result = agent.project.add_videos_from_dir(str(p), on_progress=_prog)
+            if "error" in result:
+                print(f"  ⚠ {result['error']}")
+            else:
+                print(f"  ✓ scanned {result['scanned']}, "
+                      f"added {len(result['added'])}, "
+                      f"skipped {len(result['skipped'])}")
         else:
-            print(f"  ✓ {result['video_id']}: {result['filename']} "
-                  f"({result['duration_sec']:.1f}s, {result['segment_count']} segments, "
-                  f"lang={result['language']})")
+            print(f"Pre-loading {p.name}...")
+            result = agent.project.add(str(p))
+            if "error" in result:
+                print(f"  ⚠ {result['error']}")
+            else:
+                print(f"  ✓ {result['video_id']}: {result['filename']} "
+                      f"({result['duration_sec']:.1f}s, {result['segment_count']} segments, "
+                      f"lang={result['language']})")
 
     print(HELP)
 
@@ -105,8 +124,13 @@ def main() -> None:
                 if not vids:
                     print("  (no videos loaded)")
                 for v in vids:
+                    snippet = (v.get("snippet") or "").strip()
+                    if len(snippet) > 90:
+                        snippet = snippet[:87] + "..."
                     print(f"  {v['video_id']}: {v['filename']} "
-                          f"({v['duration_sec']:.1f}s)")
+                          f"({v['duration_sec']:.1f}s, {v['segment_count']} segs)")
+                    if snippet:
+                        print(f"      └ {snippet}")
                 continue
             if cmd == "/reset":
                 # keep system prompt at index 0
@@ -122,6 +146,23 @@ def main() -> None:
                     print(f"  ⚠ {result['error']}")
                 else:
                     print(f"  ✓ added {result['video_id']}: {result['filename']}")
+                continue
+            if cmd == "/add_dir":
+                if not rest:
+                    print("  usage: /add_dir <path>")
+                    continue
+                def _prog(i, total, name, res):
+                    tag = "⚠" if "error" in res else "✓"
+                    print(f"  [{i}/{total}] {tag} {name}")
+                result = agent.project.add_videos_from_dir(
+                    rest[0], on_progress=_prog
+                )
+                if "error" in result:
+                    print(f"  ⚠ {result['error']}")
+                else:
+                    print(f"  ✓ scanned {result['scanned']}, "
+                          f"added {len(result['added'])}, "
+                          f"skipped {len(result['skipped'])}")
                 continue
             print(f"  unknown command: {cmd}")
             continue

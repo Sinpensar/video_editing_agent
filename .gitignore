@@ -4,5 +4,6 @@ __pycache__/
 .env
 output/
 workspace/
+traces/
 .DS_Store
 test/
