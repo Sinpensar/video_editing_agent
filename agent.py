@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 
 import editor
 import transcribe
+import validators
 
 if TYPE_CHECKING:
     from tracing import Tracer
@@ -52,17 +53,25 @@ You can handle anywhere from a single clip to dozens of clips at once. The avail
 - `list_videos` — see what's loaded, with a short snippet of each
 - `get_transcript(video_id)` — full timestamped transcript of one video
 - `search_segments(query, video_ids?)` — find every mention of a keyword across all (or selected) videos
+- `set_goal(...)` — register the user's editing target (length, keywords, clip count). Validators use this.
 - `create_cut(clips, output_filename?)` — splice (video_id, start, end) tuples into one mp4
 
 Workflow for a single video:
-1. User gives a file + a goal. Call `add_video`, then `get_transcript`, then pick clips, then `create_cut`.
+1. If the user mentioned a target length, required topics, or things to avoid, call `set_goal(...)` first.
+2. Call `add_video`, then `get_transcript`, then pick clips, then `create_cut`.
 
 Workflow for many videos (10+):
 1. The current project state — including a short snippet of each video — is injected into this system prompt. Read those snippets first; they give you a feel for what each video is about without spending tokens on full transcripts.
-2. If the goal is theme-based ("everything about coffee", "all the cooking parts"), call `search_segments` with the relevant keyword instead of reading every transcript end-to-end.
-3. Only call `get_transcript` on videos that actually look promising from snippets/searches.
-4. Compose the cut. Default ordering: ascending by source filename (which usually corresponds to capture time). If the user explicitly asks for a different order ("by topic", "best first"), follow their lead.
-5. Call `create_cut` and report the output path.
+2. If the user gave a clear goal, call `set_goal(...)` early so validators can enforce it.
+3. If the goal is theme-based ("everything about coffee", "all the cooking parts"), call `search_segments` instead of reading every transcript end-to-end.
+4. Only call `get_transcript` on videos that actually look promising from snippets/searches.
+5. Compose the cut. Default ordering: ascending by source filename (which usually corresponds to capture time). If the user explicitly asks for a different order, follow their lead.
+6. Call `create_cut` and report the output path.
+
+Validation & self-correction:
+- Every `create_cut` runs pre-flight checks (clip bounds, durations, duplicates, overlaps, goal compliance).
+- If the response contains `validation_failed: true`, READ each item in `issues`, FIX the offending clips, and call `create_cut` again. Do NOT pass `force=true` unless the user explicitly accepts the warnings.
+- Common fixes: shorten / extend a clip, drop a duplicate, swap two overlapping clips, add or remove clips to hit the target duration, replace a clip whose transcript misses a required keyword.
 
 Important rules:
 - Ground every editing decision in real transcript content. Don't hallucinate.
@@ -193,8 +202,11 @@ TOOLS: list[dict[str, Any]] = [
         "create_cut",
         "Cut and concatenate sub-clips into a single mp4. `clips` is an "
         "ordered list; each item picks a (start, end) window from one "
-        "registered video. Returns the absolute output path and the final "
-        "duration.",
+        "registered video. Pre-flight validation runs before ffmpeg: if it "
+        "fails, the call returns {validation_failed:true, issues:[...]} "
+        "instead of producing a file. Read the issues, fix the clips, and "
+        "call again. Returns absolute output path and final duration on "
+        "success.",
         {
             "type": "object",
             "properties": {
@@ -217,8 +229,45 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Desired output filename (e.g. 'travel_v2.mp4'). "
                                    "Optional — a unique name is generated if omitted.",
                 },
+                "force": {
+                    "type": "boolean",
+                    "description": "Bypass validation. Only set true if the "
+                                   "user has explicitly accepted the warnings.",
+                },
             },
             "required": ["clips"],
+        },
+    ),
+    _function(
+        "set_goal",
+        "Register or update the user's editing goal. Validators use this "
+        "when checking each create_cut. Call this near the start of a "
+        "session whenever the user gives a clear target (e.g. '2 minutes', "
+        "'must include the cooking part', 'no rambling about the weather'). "
+        "Pass any subset of fields; existing fields are preserved. Pass "
+        "null to clear a single field.",
+        {
+            "type": "object",
+            "properties": {
+                "target_duration_sec": {
+                    "type": "number",
+                    "description": "Target final length in seconds (±25% by default).",
+                },
+                "min_clips": {"type": "integer"},
+                "max_clips": {"type": "integer"},
+                "must_include_keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Keywords/phrases that must appear in the "
+                                   "kept content's transcript.",
+                },
+                "must_exclude_keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Keywords/phrases that must NOT appear in "
+                                   "the kept content's transcript.",
+                },
+            },
         },
     ),
 ]
@@ -255,9 +304,29 @@ class VideoEntry:
 @dataclass
 class Project:
     videos: dict[str, VideoEntry] = field(default_factory=dict)
+    # User-declared editing goal — used by validators. None until set_goal.
+    goal: dict = field(default_factory=dict)
 
     def next_id(self) -> str:
         return f"v{len(self.videos) + 1}"
+
+    def set_goal(self, **fields) -> dict:
+        """Register / update the user's editing goal.
+
+        Any of: target_duration_sec, min_clips, max_clips,
+        must_include_keywords, must_exclude_keywords. Pass None to clear
+        an individual field. Returns the resulting goal dict.
+        """
+        for k, v in fields.items():
+            if v is None:
+                self.goal.pop(k, None)
+            else:
+                self.goal[k] = v
+        return {"goal": dict(self.goal), "ok": True}
+
+    def clear_goal(self) -> dict:
+        self.goal = {}
+        return {"goal": {}, "ok": True}
 
     def add(self, path: str) -> dict:
         path_obj = Path(path).expanduser().resolve()
@@ -442,24 +511,35 @@ class Project:
             "skipped": skipped,
         }
 
-    def create_cut(self, clips: list[dict], output_filename: str | None) -> dict:
-        if not clips:
-            return {"error": "No clips provided."}
+    def create_cut(
+        self,
+        clips: list[dict],
+        output_filename: str | None,
+        *,
+        force: bool = False,
+    ) -> dict:
+        # ---- pre-flight validation -------------------------------------
+        issues = validators.validate_clips(clips, self, goal=self.goal)
+        if issues and not force:
+            return {
+                "validation_failed": True,
+                "issues": issues,
+                "goal": dict(self.goal) if self.goal else None,
+                "hint": (
+                    "Read each issue, adjust the offending clips, then call "
+                    "create_cut again. Do NOT pass force=true unless the user "
+                    "has explicitly accepted the warnings."
+                ),
+            }
 
+        # ---- resolve video_id → real path -----------------------------
         resolved: list[editor.Clip] = []
-        for i, c in enumerate(clips):
-            vid = c.get("video_id")
-            entry = self.videos.get(vid)
-            if not entry:
-                return {"error": f"clips[{i}] references unknown video_id={vid}"}
-            start = float(c["start"])
-            end = float(c["end"])
-            if end <= start:
-                return {"error": f"clips[{i}] has end<=start ({start} >= {end})"}
+        for c in clips:
+            entry = self.videos[c["video_id"]]
             resolved.append({
                 "video": str(entry.path),
-                "start": start,
-                "end": end,
+                "start": float(c["start"]),
+                "end": float(c["end"]),
             })
 
         try:
@@ -473,6 +553,7 @@ class Project:
             "view_link": f"computer://{out_path}",
             "duration_sec": round(total, 2),
             "clip_count": len(resolved),
+            "warnings": issues if issues and force else None,
         }
 
 
@@ -502,20 +583,34 @@ class VlogAgent:
     # -- dynamic system prompt ---------------------------------------------
     def _build_system_prompt(self) -> str:
         videos = self.project.list_videos()
-        if not videos:
+        goal = self.project.goal
+        if not videos and not goal:
             return SYSTEM_PROMPT
-        lines = ["", "",
-                 "Videos already loaded in the project "
-                 "(reference these video_ids directly — don't ask the user for a path):"]
-        for v in videos:
-            dur = v.get("duration_sec") or 0
-            snippet = (v.get("snippet") or "").strip()
-            lines.append(
-                f"- {v['video_id']} | {v['filename']} | "
-                f"{dur:.1f}s | {v['segment_count']} segs | lang={v.get('language')}"
-            )
-            if snippet:
-                lines.append(f"    snippet: {snippet}")
+
+        lines: list[str] = []
+
+        if goal:
+            lines.append("")
+            lines.append("")
+            lines.append("Active goal (validators will enforce this on every create_cut):")
+            for k, v in goal.items():
+                lines.append(f"- {k}: {v}")
+
+        if videos:
+            lines.append("")
+            lines.append("")
+            lines.append("Videos already loaded in the project "
+                         "(reference these video_ids directly — don't ask the user for a path):")
+            for v in videos:
+                dur = v.get("duration_sec") or 0
+                snippet = (v.get("snippet") or "").strip()
+                lines.append(
+                    f"- {v['video_id']} | {v['filename']} | "
+                    f"{dur:.1f}s | {v['segment_count']} segs | lang={v.get('language')}"
+                )
+                if snippet:
+                    lines.append(f"    snippet: {snippet}")
+
         return SYSTEM_PROMPT + "\n".join(lines)
 
     # -- tool dispatch ------------------------------------------------------
@@ -542,8 +637,16 @@ class VlogAgent:
             )
         if name == "create_cut":
             return self.project.create_cut(
-                args["clips"], args.get("output_filename")
+                args["clips"],
+                args.get("output_filename"),
+                force=bool(args.get("force", False)),
             )
+        if name == "set_goal":
+            return self.project.set_goal(**{
+                k: v for k, v in args.items()
+                if k in {"target_duration_sec", "min_clips", "max_clips",
+                         "must_include_keywords", "must_exclude_keywords"}
+            })
         return {"error": f"Unknown tool: {name}"}
 
     # -- single user turn ---------------------------------------------------

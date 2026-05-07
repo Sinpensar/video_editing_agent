@@ -93,6 +93,7 @@ vlog_agent/
 ├── agent.py         # VlogAgent + LLM function-calling loop
 ├── transcribe.py    # Whisper transcription (with file-fingerprint cache)
 ├── editor.py        # FFmpeg cut + concat
+├── validators.py    # Pre-flight checks before ffmpeg runs (reject-and-retry)
 ├── tracing.py       # Tracer — dumps every conversation turn to JSON
 ├── viewer.py        # Builds a self-contained HTML viewer for traces
 ├── workspace/       # Transcript cache (auto-created)
@@ -100,6 +101,27 @@ vlog_agent/
 ├── traces/          # Conversation traces (auto-created, one folder per session)
 └── requirements.txt
 ```
+
+## Validation & self-correction
+
+Before each `create_cut` actually runs ffmpeg, the agent runs a pre-flight
+check: clip bounds, durations, duplicates, overlaps, plus any goal you
+registered (target length, must-include / must-exclude keywords, clip
+count). If anything fails, the LLM gets back a list of issue descriptions
+and is instructed to fix the offending clips and try again — no half-baked
+mp4 ever leaves the system.
+
+Tell the agent your goal in chat and it will call `set_goal` for you:
+
+```
+you ▸ Cut a 2-minute highlight, must include the espresso shot, no rambling about weather.
+  ✓ set_goal(target_duration_sec=120, must_include_keywords=[espresso shot], must_exclude_keywords=[weather])
+  ...
+```
+
+When the LLM proposes a cut that doesn't fit, you'll see the rejection
+in the trace: `validation_failed: True, issues: [...]` followed by a
+revised `create_cut` attempt that addresses each issue.
 
 ## Inspecting what the agent did
 
