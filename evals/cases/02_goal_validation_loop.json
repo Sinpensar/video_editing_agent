@@ -1,0 +1,82 @@
+{
+  "name": "02_goal_validation_loop",
+  "description": "Verify the agent registers a goal, observes the resulting validation failure, and retries with corrected clips.",
+  "setup": {
+    "videos": [
+      {
+        "video_id": "v1",
+        "path": "/tmp/eval_coffee.mp4",
+        "transcript": {
+          "language": "en",
+          "duration": 60.0,
+          "segments": [
+            {"id": 0, "start": 0.0,  "end": 6.0,  "text": "Welcome to my coffee tutorial."},
+            {"id": 1, "start": 6.0,  "end": 12.0, "text": "First, weigh out 18 grams of espresso beans."},
+            {"id": 2, "start": 12.0, "end": 18.0, "text": "Grind them on a fine setting."},
+            {"id": 3, "start": 18.0, "end": 24.0, "text": "Lock in the portafilter."},
+            {"id": 4, "start": 24.0, "end": 30.0, "text": "Pull the espresso shot for 28 seconds."},
+            {"id": 5, "start": 30.0, "end": 36.0, "text": "Now we steam the milk to about 60 degrees."},
+            {"id": 6, "start": 36.0, "end": 42.0, "text": "Pour the milk into the espresso for a flat white."},
+            {"id": 7, "start": 42.0, "end": 48.0, "text": "And there's your finished drink."},
+            {"id": 8, "start": 48.0, "end": 60.0, "text": "Anyway, the weather is nice today."}
+          ]
+        }
+      }
+    ]
+  },
+  "prompt": "Make me a 30-second highlight focused on the espresso pulling. Skip the weather chatter.",
+  "script": [
+    {
+      "tool_calls": [
+        {"name": "set_goal", "arguments": {
+          "target_duration_sec": 30,
+          "must_include_keywords": ["espresso"],
+          "must_exclude_keywords": ["weather"]
+        }}
+      ]
+    },
+    {
+      "tool_calls": [
+        {"name": "get_transcript", "arguments": {"video_id": "v1"}}
+      ]
+    },
+    {
+      "tool_calls": [
+        {"name": "create_cut", "arguments": {
+          "clips": [
+            {"video_id": "v1", "start": 48.0, "end": 60.0, "note": "weather chat — DELIBERATELY WRONG"}
+          ]
+        }}
+      ]
+    },
+    {
+      "tool_calls": [
+        {"name": "create_cut", "arguments": {
+          "clips": [
+            {"video_id": "v1", "start": 6.0,  "end": 12.0, "note": "weigh beans"},
+            {"video_id": "v1", "start": 12.0, "end": 18.0, "note": "grind"},
+            {"video_id": "v1", "start": 18.0, "end": 24.0, "note": "lock portafilter"},
+            {"video_id": "v1", "start": 24.0, "end": 30.0, "note": "pull espresso"},
+            {"video_id": "v1", "start": 36.0, "end": 42.0, "note": "milk pour"}
+          ]
+        }}
+      ]
+    },
+    {
+      "content": "Picked 5 clips, 30s total, focused on the espresso flow. Skipped the weather tangent."
+    }
+  ],
+  "checks": [
+    {"type": "no_agent_error"},
+    {"type": "tool_called", "tool": "set_goal"},
+    {"type": "tool_args_match", "tool": "set_goal",
+      "args_contain": {"target_duration_sec": 30}},
+    {"type": "tool_called", "tool": "create_cut", "min_count": 2},
+    {"type": "no_validation_failures"},
+    {"type": "kept_text_includes", "patterns": ["espresso"]},
+    {"type": "kept_text_excludes", "patterns": ["weather"]},
+    {"type": "duration_in", "min": 23, "max": 37},
+    {"type": "clip_count", "min": 4, "max": 8},
+    {"type": "max_total_tokens", "value": 50000}
+  ]
+}

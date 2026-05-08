@@ -13,26 +13,30 @@
                               │                          └► traces/<session>/turn_NNN.json
                               │
                               ├──►  transcribe.py     ──►  ffmpeg + Whisper
-                              │     (video → 带时间戳字幕)
+                              │     (video 音频 → 带时间戳字幕)
+                              │
+                              ├──►  vision.py         ──►  ffmpeg + GLM-4V-Flash
+                              │     (video 帧 → 结构化标签)
                               │
                               ├──►  validators.py     ──►  pre-flight 检查 clips
                               │     (越界/重复/重叠/目标偏差)
                               │
                               ├──►  editor.py         ──►  ffmpeg
-                              │     (字幕里挑出的 (start,end) → mp4)
+                              │     (LLM 挑出的 (start,end) → mp4)
                               │
                               └──►  OpenAI 兼容 API (默认智谱 GLM-4-Flash)
-                                    (读字幕 + 决定剪哪几段)
+                                    (读字幕 + 视觉标签 + 决定剪哪几段)
 
                               traces/ ──► viewer.py ──► viewer.html (浏览器查看)
 ```
 
-七个文件的职责:
-- **transcribe.py** —— 把视频转成带时间戳的字幕(是「让 LLM 看懂视频」的关键)
+八个文件的职责:
+- **transcribe.py** —— 视频音频 → 带时间戳字幕(「让 LLM 听懂」)
+- **vision.py** —— 视频画面 → 结构化标签(「让 LLM 看懂」)
 - **editor.py** —— 拿到 `(start, end)` 列表后,真正去切视频、拼成片
 - **agent.py** —— 对话核心:管理项目状态、定义工具、跑 LLM 工具调用循环
 - **validators.py** —— pre-flight 校验层,reject-and-retry 的核心
-- **tracing.py** —— observability 层:每轮对话结构化 dump 到 JSON,记录所有 LLM 和工具调用
+- **tracing.py** —— observability 层:每轮对话结构化 dump 到 JSON
 - **viewer.py** —— 把 traces/ 里的 JSON 渲染成自包含 HTML 查看器
 - **main.py** —— CLI 外壳:启动、解析参数、命令行交互、把日志打给你看
 
@@ -266,11 +270,184 @@ def format_time(seconds: float) -> str:
 
 ---
 
-## 2. editor.py — FFmpeg 切片 + 拼接
+## 2. vision.py — 视频转结构化标签
+
+文件 ~200 行,架构上跟 `transcribe.py` 镜像 —— 同样输入视频文件,同样按文件指纹缓存,同样导出一个公开函数 `analyze_visuals(video_path)`。区别在于:transcribe 用 Whisper(本地、免费、慢)处理音频,vision 用云端视觉 LLM(默认 GLM-4V-Flash,免费)处理画面帧。
+
+### 2.1 输出结构
+
+```python
+{
+    "video": "/path/cooking.mp4",
+    "model": "glm-4v-flash",
+    "sample_fps": 0.5,
+    "frame_count": 30,
+    "frames": [
+        {
+            "id": 0,
+            "time": 5.0,
+            "tags": {
+                "subject": "person cooking",
+                "scene": "indoor_kitchen",
+                "action": "slow",
+                "interest": 7,
+                "tags": ["food_prep", "close-up"],
+                "note": "chef preparing dish",
+            },
+        },
+        ...
+    ]
+}
+```
+
+**为什么是结构化标签而不是自由文字?** 一段散文描述 80–150 token,这套结构 ≈25 token。30 帧的视频,主 LLM 看到的视觉上下文从 4500 token 降到 750 token,**6× 节省**。而且结构化字段可以直接 grep/filter,后续做主题筛选不用再过一次 LLM。
+
+### 2.2 默认参数
+
+```python
+DEFAULT_VISION_MODEL = os.getenv("VISION_MODEL", "glm-4v-flash")
+DEFAULT_VISION_BASE_URL = os.getenv("VISION_BASE_URL",
+    os.getenv("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/"))
+DEFAULT_MAX_FRAMES = int(os.getenv("VISION_MAX_FRAMES", "30"))
+DEFAULT_MAX_WIDTH = 640
+```
+
+`VISION_BASE_URL` 默认回退到 `LLM_BASE_URL` —— 智谱同一个 endpoint 既服务 glm-4-flash 也服务 glm-4v-flash,key 是同一个。如果你想用不同 provider 做视觉(比如文本智谱 + 视觉 Gemini),独立设置 `VISION_BASE_URL` 即可。
+
+`VISION_MAX_FRAMES=30` 是关键安全帽。一段 10 分钟视频如果按每秒 1 帧抽,要 600 次 API 调用 —— 又慢又贵。这个上限保证「无论多长的视频,最多分析 30 帧」,把 first-run 时间锁定在 30–60 秒。
+
+### 2.3 Prompt 设计
+
+```python
+PROMPT_SINGLE_FRAME = """You are tagging frames for an automatic video editor.
+
+Examine the image and return ONE JSON object with these exact keys:
+- "subject":   1-3 word noun phrase ...
+- "scene":     one of "indoor", "outdoor_urban", ...
+- "action":    one of "still", "slow", "fast"
+- "interest":  integer 1-10
+- "tags":      array of 1-4 short keyword tags, lowercase
+- "note":      ≤15 word caption
+
+Output ONLY the JSON object — no markdown fences, no commentary, no preamble."""
+```
+
+写 prompt 给视觉模型有几个关键技巧:
+- **显式枚举可选值**(scene 的 7 个值、action 的 3 个值)—— 否则模型会自由发挥,你拿到的会是「kitchen-ish」「semi-outdoor」这种没法 grep 的描述。
+- **强调 ONLY JSON** —— 即便如此 GLM-4V-Flash 还是经常加 ```json``` 围栏(下面的解析器会处理)。
+- **interest 限定为 1-10 整数** —— 给主 LLM 一个连续可比较的「值得不值得保留」信号。
+
+### 2.4 ffmpeg 抽帧 `_extract_frame`
+
+```python
+def _extract_frame(video_path, time_sec, out_path, max_width=640):
+    cmd = [
+        "ffmpeg",
+        "-ss", f"{time_sec:.3f}",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        "-vf", f"scale='min({max_width},iw)':-2",
+        "-q:v", "3",
+        "-y",
+        str(out_path),
+    ]
+```
+
+- `-ss` 在 `-i` 前 = 快速 seek(精度差几帧但飞快)
+- `-frames:v 1` = 只抽一帧
+- `scale='min(640,iw)':-2'` = 横边不超过 640px,高度自动配比保持纵横比
+- `-q:v 3` = JPEG 质量 3(2-5 是常用范围,既清楚又文件小)
+
+为什么要降到 640px?**视觉 LLM 不需要 4K**,大部分内部都会下采样到 768px 左右。直接 base64 一张 4K 图等于浪费 90% 的传输 token。
+
+### 2.5 容错的 JSON 解析 `_parse_vision_json`
+
+视觉模型经常不老实,会:
+- 加 ```json...``` 围栏
+- 在 JSON 前加 "Sure, here's the analysis: "
+- 偶尔直接拒答:"I can't analyze this image safely"
+
+解析器三步走:正则去掉 markdown 围栏 → 找第一个 `{` 扫描到平衡的 `}` → 都失败就把 `_parse_error` + 原文前 300 字写回去。
+
+**关键设计:解析失败不抛异常,返回带 `_parse_error` 字段的 dict**。这样 caller 收到的是结构,可以照常往下走;主 LLM 看到错误信息也能决定要不要跳过这一帧。
+
+### 2.6 核心入口 `analyze_visuals`
+
+跟 `transcribe.transcribe()` 一一对应:
+
+```python
+fp = _file_fingerprint(video_path)
+cache_path = WORKSPACE / f"{video_path.stem}.{fp}.{model_name}.visuals.json"
+if cache_path.exists() and not force:
+    return json.loads(cache_path.read_text())
+```
+
+同一个文件、同一个模型 → 直接读缓存。重跑零成本。
+
+```python
+duration = _video_duration(video_path)
+n = min(max_frames, max(1, int(duration / 2)))
+interval = duration / n
+times = [round((i + 0.5) * interval, 2) for i in range(n)]
+```
+
+均匀采样,每一帧落在它代表区间的中点(避免取到淡入/淡出的过渡帧)。
+
+```python
+for i, t in enumerate(times):
+    _extract_frame(video_path, t, frame_path)
+    try:
+        resp = client.chat.completions.create(model=model_name, messages=[...])
+        tags = _parse_vision_json(resp.choices[0].message.content)
+    except Exception as e:
+        tags = {"_api_error": str(e)}
+    frames.append({"id": i, "time": t, "tags": tags})
+```
+
+逐帧调用,**单帧失败不影响整批**。最后一并 dump 到缓存文件 + 返回。
+
+`client` 参数允许测试时注入 fake client,跑端到端不联网。
+
+### 2.7 `frame_search_text` 帮手
+
+把一帧的标签拍平成单一可搜索字符串。**对解析失败的帧返回空串**(不参与搜索),不会污染结果。`Project.search_visuals()` 调用这个做 substring 匹配。
+
+### 2.8 还没做的优化(为什么 v1 这么朴素)
+
+- **场景检测** —— 用 PySceneDetect 找真正的画面切换点,只在切换处抽一帧。30 帧降到 15-20 帧。
+- **沉默时段过滤** —— 跟 transcript 做差集,只在没人说话的时段抽帧(有字幕已经够主 LLM 决策了)。
+- **4-grid 批处理** —— 把 4 帧拼成 2×2 大图,一次 API 调用解决 4 帧。**API 调用次数 ÷4**,延迟 ÷4。
+- **并行调用** —— `concurrent.futures.ThreadPoolExecutor` 8 个并发,30 帧从 60 秒压到 8 秒。
+
+这些都是 drop-in 优化,不需要改 agent 侧。**先把端到端跑通,看 viewer 里 LLM 怎么用视觉信息,再有针对性削成本** —— 比一开始就上花活效率高。
+
+### 2.9 与 agent 的接口
+
+主 agent 通过 `Project` 间接用这个模块:
+
+```python
+class Project:
+    visuals: dict[str, dict] = field(default_factory=dict)
+
+    def analyze_visuals(self, video_id, *, max_frames=None, force=False):
+        # → 调 vision.analyze_visuals,缓存结果到 self.visuals[video_id]
+
+    def get_visuals(self, video_id):
+        # → 返回 self.visuals[video_id] 的全部 frames
+
+    def search_visuals(self, query, video_ids=None, max_results=30):
+        # → 遍历已分析视频的 frames,用 vision.frame_search_text 做 substring 匹配
+```
+
+LLM 通过三个工具 `analyze_video_visuals` / `search_visuals` / `get_visuals` 触发它们,跟 `transcribe` 那条线完全平行。SYSTEM_PROMPT 里专门写了一段「**Speech vs vision**」教模型何时该用字幕、何时该升级到视觉。
+
+---
+
+## 3. editor.py — FFmpeg 切片 + 拼接
 
 文件 ~150 行。一个公开函数 `assemble()`,两个私有 `_cut_one` / `_concat`,加一个工具 `probe_duration`。
 
-### 2.1 文档字符串与策略说明(1–14 行)
+### 3.1 文档字符串与策略说明(1–14 行)
 
 文档解释了**为什么不用 `-c copy` 直接切**:
 直接 copy 切的位置必须落在视频关键帧(keyframe)上,否则要么开头黑屏要么开头有马赛克。我们这里采用**先逐段重新编码,再 concat**:
@@ -279,7 +456,7 @@ def format_time(seconds: float) -> str:
 
 代价是慢 2-3 倍,但效果稳定。
 
-### 2.2 输出目录 + Clip 类型(25–32 行)
+### 3.2 输出目录 + Clip 类型(25–32 行)
 
 ```python
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -295,7 +472,7 @@ class Clip(TypedDict):
 
 为什么用 dict 不用 dataclass?因为 `editor.py` 跟 LLM 来回传输的是 JSON,而 JSON 自然映射到 dict。dataclass 还要 `asdict()` 转一次,没必要。
 
-### 2.3 包装 ffmpeg 调用 `_run`(35–42 行)
+### 3.3 包装 ffmpeg 调用 `_run`(35–42 行)
 
 ```python
 def _run(cmd: list[str]) -> None:
@@ -312,7 +489,7 @@ def _run(cmd: list[str]) -> None:
 - `shlex.quote` —— 把命令重新组成可以复制粘贴回 shell 的形式(参数里有空格也能正确加引号)。报错时方便你直接复刻命令调试。
 - `[-1500:]` —— 只保留 stderr 末尾 1500 字符。ffmpeg 的 stderr 极长,大部分是初始化信息,真正错误信息一般在末尾。
 
-### 2.4 切单段 `_cut_one`(45–63 行)
+### 3.4 切单段 `_cut_one`(45–63 行)
 
 ```python
 def _cut_one(clip: Clip, out_path: Path) -> None:
@@ -346,7 +523,7 @@ def _cut_one(clip: Clip, out_path: Path) -> None:
 - `-movflags +faststart` —— 把 mp4 的 metadata 移到文件头,**网页里播放可以边下边播**,不用整个下完才播。
 - `-y` —— 覆盖已存在的输出文件,不问。
 
-### 2.5 拼接 `_concat`(66–88 行)
+### 3.5 拼接 `_concat`(66–88 行)
 
 ```python
 def _concat(parts: list[Path], out_path: Path) -> None:
@@ -384,7 +561,7 @@ p.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))
 
 `delete=False` —— 临时文件不会在 with 块结束时自动删,需要手动 `unlink`。这里这么写是因为 ffmpeg 进程要在 with 块退出之后才能读到文件。`finally` 确保最后一定删除。
 
-### 2.6 入口 `assemble`(91–121 行)
+### 3.6 入口 `assemble`(91–121 行)
 
 ```python
 def assemble(clips: Iterable[Clip], output_filename: str | None = None) -> Path:
@@ -425,7 +602,7 @@ def assemble(clips: Iterable[Clip], output_filename: str | None = None) -> Path:
 
 `f"part_{i:03d}"` —— 数字补 0 到 3 位:`part_000`, `part_001`, ..., `part_010`,这样按文件名排序就是按顺序。
 
-### 2.7 `probe_duration` + `__main__`(124–149 行)
+### 3.7 `probe_duration` + `__main__`(124–149 行)
 
 ```python
 def probe_duration(video_path: str | Path) -> float:
@@ -446,7 +623,7 @@ python editor.py plan.json
 
 ---
 
-## 3. agent.py — 对话核心
+## 4. agent.py — 对话核心
 
 最长(~610 行),也是最有意思的一个文件。结构:
 
@@ -460,7 +637,7 @@ TOOLS = [6 个工具的 JSON schema]
 class VlogAgent       ← 跟 LLM 来回的循环
 ```
 
-### 3.1 imports + 配置(21–41 行)
+### 4.1 imports + 配置(21–41 行)
 
 ```python
 import json, os
@@ -487,7 +664,7 @@ DEFAULT_BASE_URL = os.getenv(
 - `load_dotenv()` —— 读 `.env` 文件里的变量,塞进 `os.environ`。这里是模块加载时就执行,所以下面 `os.getenv(...)` 已经能拿到值。
 - `import editor / transcribe` —— 同目录下的两个模块,直接相对导入。
 
-### 3.2 SYSTEM_PROMPT(43–70 行)
+### 4.2 SYSTEM_PROMPT(43–70 行)
 
 这就是给 LLM 看的「岗位说明书 + SOP」。每次发请求都会作为第一条 message 发给 LLM。
 
@@ -498,7 +675,7 @@ DEFAULT_BASE_URL = os.getenv(
 
 **写 system prompt 的核心心得:** 多用具体场景例子,少用抽象命令。LLM 看到「'everything about coffee'」比看「theme-based search」更知道该用哪个工具。
 
-### 3.3 工具 schema 帮手 `_function`(73–82 行)
+### 4.3 工具 schema 帮手 `_function`(73–82 行)
 
 ```python
 def _function(name, description, parameters):
@@ -514,7 +691,7 @@ def _function(name, description, parameters):
 
 OpenAI function-calling 协议要求外面包一层 `{"type":"function","function":{...}}`。每次手写太啰嗦,封装成帮手。
 
-### 3.4 TOOLS 列表(85–220 行)
+### 4.4 TOOLS 列表(85–220 行)
 
 6 个工具的 JSON schema。每一个都是用 `_function(name, description, parameters)` 定义。
 
@@ -547,7 +724,7 @@ LLM 只会看到 `name + description + parameters`,看不到 Python 函数本身
 
 注意 description 不光说「这个工具做什么」,还说了「**什么时候用**」(many videos + theme-based)、「**返回什么结构**」(segments with video_id and timestamps)。这两条对 LLM 决策最关键。
 
-### 3.5 `VideoEntry` dataclass(223–248 行)
+### 4.5 `VideoEntry` dataclass(223–248 行)
 
 ```python
 @dataclass
@@ -578,11 +755,11 @@ class VideoEntry:
 
 `snippet()` 的策略:把所有 segment 的 text 拼一起,如果总长 <= 头+尾+5(头 140 + 尾 80 + 一个 `…` 大概 5 字符),就直接返回完整文本;否则取头 140 字 + 「 … 」 + 尾 80 字。这个 snippet 会进系统提示给 LLM 看,**让它对每个视频有个 220 字左右的「印象」**,不用读全文也能选片。
 
-### 3.6 `Project` dataclass(251–472 行)
+### 4.6 `Project` dataclass(251–472 行)
 
 整个文件最重要的类。是「项目状态 + 所有真实业务方法」。LLM 调用的每个工具背后都是 Project 里的一个方法。
 
-#### 3.6.1 状态 + 工具方法(251–256 行)
+#### 4.6.1 状态 + 工具方法(251–256 行)
 
 ```python
 @dataclass
@@ -595,7 +772,7 @@ class Project:
 
 `field(default_factory=dict)` —— dataclass 默认值如果是可变对象(dict / list)必须用 `default_factory`,否则所有实例会共享同一个 dict(经典 Python 坑)。
 
-#### 3.6.2 `add()` —— 加一个视频(258–276 行)
+#### 4.6.2 `add()` —— 加一个视频(258–276 行)
 
 ```python
 def add(self, path: str) -> dict:
@@ -622,7 +799,7 @@ def add(self, path: str) -> dict:
 
 「已经加过的同路径直接返回原条目」—— 防止 LLM 重复添加导致 v1/v2/v3 都指向同一个文件。
 
-#### 3.6.3 `_summary()` —— 摘要生成器(278–291 行)
+#### 4.6.3 `_summary()` —— 摘要生成器(278–291 行)
 
 ```python
 def _summary(self, entry: VideoEntry, *, include_snippet: bool = False) -> dict:
@@ -643,7 +820,7 @@ def _summary(self, entry: VideoEntry, *, include_snippet: bool = False) -> dict:
 
 把一个 VideoEntry 转成 LLM-friendly 的 dict。`*, include_snippet` 是 keyword-only 参数(必须 `_summary(e, include_snippet=True)` 调用,不能位置传)。
 
-#### 3.6.4 `list_videos()`(293–296 行)
+#### 4.6.4 `list_videos()`(293–296 行)
 
 ```python
 def list_videos(self) -> list[dict]:
@@ -653,7 +830,7 @@ def list_videos(self) -> list[dict]:
 
 按文件名排序,把每个的摘要(带 snippet)返回。**排序很重要**:LLM 多次调用看到的顺序固定,推理稳定;而且文件名通常带日期/时间,顺序就是时间顺序。
 
-#### 3.6.5 `get_transcript()`(298–309 行)
+#### 4.6.5 `get_transcript()`(298–309 行)
 
 ```python
 def get_transcript(self, video_id: str) -> dict:
@@ -672,7 +849,7 @@ def get_transcript(self, video_id: str) -> dict:
 
 注意 error 信息里**附上已有 video_id 列表**(`Known: ['v1','v2']`)。这样 LLM 看到错误立刻知道「噢,我应该用 v1 不是 v3」,不需要再调一次 list_videos。**给 LLM 的错误信息要主动包含足够上下文。**
 
-#### 3.6.6 `search_segments()`(311–370 行)
+#### 4.6.6 `search_segments()`(311–370 行)
 
 最复杂的一个,但思路简单:遍历目标视频的所有 segment,文本里包含 query 就算 hit。
 
@@ -683,7 +860,7 @@ def get_transcript(self, video_id: str) -> dict:
 - `if len(hits) >= max_results: break` —— 双层 break(内外两个 for 都要 break),避免找到上限后还继续遍历。
 - 返回 `truncated: bool` —— 让 LLM 知道结果是否被截断了,需要的话可以收紧 query 再搜。
 
-#### 3.6.7 `add_videos_from_dir()`(378–439 行)
+#### 4.6.7 `add_videos_from_dir()`(378–439 行)
 
 ```python
 def add_videos_from_dir(self, path, pattern=None, recursive=False,
@@ -724,7 +901,7 @@ def add_videos_from_dir(self, path, pattern=None, recursive=False,
 - `max_videos` 安全帽 —— 同样防爆炸,默认 100 应该够大部分场景。
 - `on_progress` 回调 —— Project 类里**不直接 print**,而是接受一个回调,让外层(CLI、Web UI、未来的 GUI)各自决定怎么显示。这是经典的「关注点分离」。
 
-#### 3.6.8 `create_cut()`(441–472 行)
+#### 4.6.8 `create_cut()`(441–472 行)
 
 ```python
 def create_cut(self, clips: list[dict], output_filename: str | None) -> dict:
@@ -762,9 +939,9 @@ LLM 给的是 `[{video_id: "v1", start, end}, ...]`,这里要做两件事:
 
 `view_link: "computer://..."` —— 一些桌面 / IDE 能识别这个 scheme 直接打开文件,方便用户点开预览。
 
-### 3.7 `VlogAgent` 类(475–608 行)
+### 4.7 `VlogAgent` 类(475–608 行)
 
-#### 3.7.1 `__init__`(476–495 行)
+#### 4.7.1 `__init__`(476–495 行)
 
 ```python
 def __init__(self, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL,
@@ -785,7 +962,7 @@ def __init__(self, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL,
 - `messages` 列表保存整段对话历史,index 0 永远是 system prompt(下面会动态更新)。
 - `tracer` —— 可选的 observability 钩子,见第 4 节。`None` 时所有 trace 调用都是 no-op,业务逻辑完全不受影响。
 
-#### 3.7.2 `_build_system_prompt`(495–512 行)
+#### 4.7.2 `_build_system_prompt`(495–512 行)
 
 ```python
 def _build_system_prompt(self) -> str:
@@ -808,7 +985,7 @@ def _build_system_prompt(self) -> str:
 
 为什么不用单独的 message 传?因为单独 message 会被算到对话上下文里,后续会被 LLM 当成「用户在某个时刻告诉我了这件事」;塞进 system prompt 是「这是当前事实」。语义不同。
 
-#### 3.7.3 `_dispatch`(514–540 行)
+#### 4.7.3 `_dispatch`(514–540 行)
 
 ```python
 def _dispatch(self, name, args):
@@ -823,7 +1000,7 @@ def _dispatch(self, name, args):
 
 工具名 → Project 方法的映射。可以用字典+lambda 写更紧凑,但 if/elif 形式直白,加新工具不会忘改测试。
 
-#### 3.7.4 `chat()` —— 核心循环(542–615 行)
+#### 4.7.4 `chat()` —— 核心循环(542–615 行)
 
 整个程序的「灵魂」就这块。详细看:
 
@@ -912,17 +1089,17 @@ def chat(self, user_input, *, on_tool=None):
 
 ---
 
-## 4. validators.py — pre-flight 检查层
+## 5. validators.py — pre-flight 检查层
 
 文件 ~150 行。一个公开函数 `validate_clips(clips, project, goal)` 返回一个**字符串列表**。空列表 = 通过,非空 = 每条字符串都是一个具体的问题描述。
 
-### 4.1 设计哲学:为什么不抛异常,返回字符串列表
+### 5.1 设计哲学:为什么不抛异常,返回字符串列表
 
 传统软件里参数错通常 `raise ValueError`。这里不抛是因为:**LLM 看不到异常,只能看到 tool result**。返回结构化的「问题描述列表」给 LLM,它能逐条读、逐条修。**字符串还要写得「可读且可操作」**:
 - ❌ 不好:`"Invalid clip[2]"`(LLM 不知道哪里错)
 - ✅ 好:`"clip[2] end (180.50s) exceeds duration of v1 (95.30s)"`(明确告诉它怎么改)
 
-### 4.2 两层校验
+### 5.2 两层校验
 
 ```python
 # 层 1:Sanity checks(永远跑)— 抓低级错误
@@ -942,7 +1119,7 @@ def chat(self, user_input, *, on_tool=None):
 - must_exclude_keywords 必须不出现在保留内容的字幕里
 ```
 
-### 4.3 关键函数 `_clipped_text`(36–48 行)
+### 5.3 关键函数 `_clipped_text`(36–48 行)
 
 ```python
 def _clipped_text(clips, project) -> str:
@@ -959,11 +1136,11 @@ def _clipped_text(clips, project) -> str:
 
 这是关键词检查的基础:**把所有「保留下来的字幕文字」拼成一大段**,再看必含/必排关键词在不在里面。重叠判定用 `seg.end > clip.start AND seg.start < clip.end`,经典区间相交。
 
-### 4.4 Per-clip 检查(73–122 行)
+### 5.4 Per-clip 检查(73–122 行)
 
 逐个 clip 看 7 件事:type-cast 不掉链子(`try float()`),video_id 存在,start ≥ 0,end > start,end 不超过视频时长,时长在 [min, max] 范围内。每发现一处问题 append 一条人话描述。**注意 `continue`**:遇到致命错误(end<=start)就跳到下一个 clip,不再继续后面对该 clip 的检查 —— 否则会输出「end 也超时长」「时长也太短」一堆派生问题让 LLM 困惑。
 
-### 4.5 重复 + 重叠(124–157 行)
+### 5.5 重复 + 重叠(124–157 行)
 
 ```python
 # 重复:基于 (video_id, round(start,2), round(end,2)) 三元组
@@ -986,7 +1163,7 @@ for vid, items in by_video.items():
 
 为什么 `round(.., 2)`?Whisper 的时间戳本来就是浮点数,LLM 复制时也会保留小数;但 `0.5000001` 跟 `0.5` 在内存里不相等。round 到 2 位避免误判。
 
-### 4.6 Goal checks(159–202 行)
+### 5.6 Goal checks(159–202 行)
 
 只在 `goal` 字段被显式设置时才跑。每一项都按「目标存在 → 检查 → 不达标 append issue」的固定模式。
 
@@ -994,7 +1171,7 @@ for vid, items in by_video.items():
 
 `must_include_keywords` / `must_exclude_keywords` 的检查是 `O(n_clips × n_segments × n_keywords)`,但常量都很小(几十个 segment、几个 keyword),效率不是问题。
 
-### 4.7 设计权衡:为什么 v1 没做严重程度分级
+### 5.7 设计权衡:为什么 v1 没做严重程度分级
 
 理想方案是把 issue 分成 `critical / warning`:critical 必须修才能跑,warning 可以 `force=true` 跳过。但:
 - 实现复杂度上去了一档
@@ -1002,7 +1179,7 @@ for vid, items in by_video.items():
 
 V1 做法:全部当作 critical。LLM 想跳过得**显式传 `force=true`**,而 system prompt 明确告诉它「只在用户接受了警告之后才传 force」。这样 LLM 默认会去修正,而不是绕过。
 
-### 4.8 怎么接进 `Project.create_cut`
+### 5.8 怎么接进 `Project.create_cut`
 
 ```python
 def create_cut(self, clips, output_filename, *, force=False):
@@ -1019,7 +1196,7 @@ def create_cut(self, clips, output_filename, *, force=False):
 
 返回值里 `validation_failed: True` 是给 LLM 的明确信号。`hint` 是「怎么自我修复」的提示。`goal` 一并附上,提醒 LLM 当前目标是什么。
 
-### 4.9 配套的 `set_goal` 工具
+### 5.9 配套的 `set_goal` 工具
 
 LLM 通过这个工具登记用户目标:
 
@@ -1045,11 +1222,11 @@ Active goal (validators will enforce this on every create_cut):
 
 ---
 
-## 5. tracing.py — observability 层
+## 6. tracing.py — observability 层
 
 文件 ~170 行。一个类 `Tracer`,记录 agent 在每轮对话里的全部活动到 `traces/<session_id>/`。
 
-### 5.1 文件用途与目录结构(1–22 行)
+### 6.1 文件用途与目录结构(1–22 行)
 
 ```
 traces/
@@ -1066,7 +1243,7 @@ traces/
 - 文件颗粒度按 turn 分,既不会因为太细(每个 LLM 调用一个文件)导致文件爆炸,也不会因为太粗(整个 session 一个文件)导致写盘频繁的并发问题。
 - JSON 文件可读、可搜索、可 diff、可被 viewer.py 离线渲染。
 
-### 5.2 帮手 `_truncate_for_log`(28–42 行)
+### 6.2 帮手 `_truncate_for_log`(28–42 行)
 
 ```python
 def _truncate_for_log(value, max_chars=4000):
@@ -1086,7 +1263,7 @@ def _truncate_for_log(value, max_chars=4000):
 如果一个 tool 的返回值超过 4 KB(典型例子:`get_transcript` 返回完整字幕),只留**头一半 + 尾四分之一**,标记为 truncated。
 trace 文件会保持小巧,`viewer.html` 加载也快;真要看完整内容可以查 cache 或重跑。
 
-### 5.3 `Tracer.__init__`(48–73 行)
+### 6.3 `Tracer.__init__`(48–73 行)
 
 ```python
 def __init__(self, session_id=None, traces_dir=None,
@@ -1105,7 +1282,7 @@ def __init__(self, session_id=None, traces_dir=None,
 `session_id` 默认是 `YYYYMMDD_HHMMSS` 格式,做目录名 + UI 标签都直观。
 `_cur` 保存当前正在记录的 turn 字典,turn 结束才 flush 到磁盘 —— 中途 crash 也能保住已经写好的 turns。
 
-### 5.4 元数据写盘 `_write_meta`(75–93 行)
+### 6.4 元数据写盘 `_write_meta`(75–93 行)
 
 ```python
 def _write_meta(self, turns: int) -> None:
@@ -1122,7 +1299,7 @@ def _write_meta(self, turns: int) -> None:
 
 每次 `end_turn` 后会重写 `session.json` 更新 `turns` 计数,但 `started_at` 保持第一次写入的值不被覆盖。这样 viewer 显示「会话从 X 开始,共 N 轮」一目了然。
 
-### 5.5 `begin_turn`(97–117 行)
+### 6.5 `begin_turn`(97–117 行)
 
 ```python
 def begin_turn(self, user_input: str) -> None:
@@ -1144,7 +1321,7 @@ def begin_turn(self, user_input: str) -> None:
 
 新一轮开始,准备一个空骨架。`steps` 跟 `tool_calls` 是平级两个数组,通过 `step` 字段相互关联(后面 viewer 用这个把 LLM 决策和它产生的工具结果对应起来)。
 
-### 5.6 `record_llm_call`(119–169 行)
+### 6.6 `record_llm_call`(119–169 行)
 
 ```python
 def record_llm_call(self, request_messages, response, latency_ms):
@@ -1188,7 +1365,7 @@ def record_llm_call(self, request_messages, response, latency_ms):
 - `stop_reason`(`tool_calls` / `stop` / `length`)很关键 —— 看 LLM 为什么停下来:还要调工具?给最终答了?还是 token 上限被打断?
 - 工具的 `arguments` 立刻 `json.loads` 成 dict,避免 viewer 再去 parse 一次嵌套的 JSON 字符串。
 
-### 5.7 `record_tool_call`(171–192 行)
+### 6.7 `record_tool_call`(171–192 行)
 
 ```python
 def record_tool_call(self, name, args, result, duration_ms, is_error):
@@ -1207,7 +1384,7 @@ def record_tool_call(self, name, args, result, duration_ms, is_error):
 
 `step` 字段是关键 —— viewer 渲染时,把 `tool_calls` 里 `step == N` 的所有项,展示在第 N 个 LLM step 下方。这样用户看到的是「第 N 步 LLM 决定调 X 和 Y,X 的结果是这样,Y 的结果是这样」的层次。
 
-### 5.8 `end_turn`(194–204 行)
+### 6.8 `end_turn`(194–204 行)
 
 ```python
 def end_turn(self, final_reply):
@@ -1222,17 +1399,17 @@ def end_turn(self, final_reply):
 `turn_{N:03d}.json` —— 数字补 3 位,排序自然。
 `indent=2` —— pretty-print JSON,方便人工 cat 看。
 
-### 5.9 容错设计
+### 6.9 容错设计
 
 留意 Tracer 里大量 `if not self._cur: return` —— 即使 caller 顺序调错(没 `begin_turn` 就 `record_*`),也只会 silently skip,不会让真业务因为 trace 失败而崩。**Observability 一定要「壮硕」,不能让监控本身变成单点故障。**
 
 ---
 
-## 6. viewer.py — 把 trace JSON 变成可看的 HTML
+## 7. viewer.py — 把 trace JSON 变成可看的 HTML
 
 文件 ~290 行,大部分是 HTML/CSS/JS 模板。Python 部分只做两件事:扫目录、把数据塞进模板。
 
-### 6.1 数据收集 `collect_sessions`(28–55 行)
+### 7.1 数据收集 `collect_sessions`(28–55 行)
 
 ```python
 def collect_sessions(traces_dir):
@@ -1249,7 +1426,7 @@ def collect_sessions(traces_dir):
 
 直白:扫目录 → 读所有 JSON → 拼成数组。`sorted()` 按 session_id(时间戳)和 turn 文件名排序,viewer 里就是时间正序。
 
-### 6.2 HTML 模板(58–225 行)
+### 7.2 HTML 模板(58–225 行)
 
 注意第 64 行附近:
 
@@ -1268,7 +1445,7 @@ const SESSIONS = __DATA__;
 
 CSS 是手写深色主题(没引外部资源,纯 vendored),JS 是纯 vanilla DOM 操作(不引 React/Vue 这种,避免 build step)。
 
-### 6.3 渲染逻辑(JS 部分)
+### 7.3 渲染逻辑(JS 部分)
 
 JS 三个核心函数:
 
@@ -1291,7 +1468,7 @@ for (const step of turn.steps) {
 
 把同一 step 触发的所有 tool_call 摆到那个 step 节点下面,形成「LLM 决定 → 触发的工具结果」的层次。
 
-### 6.4 命令行入口 `main`(259–286 行)
+### 7.4 命令行入口 `main`(259–286 行)
 
 ```python
 ap.add_argument("--traces", default=str(DEFAULT_TRACES_DIR))
@@ -1308,7 +1485,7 @@ ap.add_argument("--open", action="store_true")
 python viewer.py --open    # 最常用
 ```
 
-### 6.5 设计权衡:为什么不做实时面板
+### 7.5 设计权衡:为什么不做实时面板
 
 也可以起一个 Flask/FastAPI server,实时读 traces 目录,websocket 推送给前端做实时 dashboard。但:
 - 开发复杂度 ×3
@@ -1321,11 +1498,11 @@ python viewer.py --open    # 最常用
 
 ---
 
-## 7. main.py — CLI 外壳
+## 8. main.py — CLI 外壳
 
 最简单的一个文件,~177 行,几乎都是 IO 和 UI。
 
-### 7.1 文档 + 常量(1–37 行)
+### 8.1 文档 + 常量(1–37 行)
 
 ```python
 HELP = """\
@@ -1339,7 +1516,7 @@ BANNER = r"""
 
 `r"""..."""` —— 原始字符串,反斜杠不转义。ASCII art 里有 `\_` 这种不希望被解释的。
 
-### 7.2 工具调用日志辅助(40–53 行)
+### 8.2 工具调用日志辅助(40–53 行)
 
 ```python
 def _print_tool(name, args, result):
@@ -1363,9 +1540,9 @@ def _short(value, limit=80):
 
 `_short` 截断长输出避免刷屏。
 
-### 7.3 `main()` 函数(56–172 行)
+### 8.3 `main()` 函数(56–172 行)
 
-#### 7.3.1 启动检查 + Tracer(57–72 行)
+#### 8.3.1 启动检查 + Tracer(57–72 行)
 
 ```python
 if not os.getenv("LLM_API_KEY"):
@@ -1390,7 +1567,7 @@ except RuntimeError as e:
 
 如果你想关掉 trace(比如想跑一个不留痕迹的会话),只要在这行不传 tracer 就行:`VlogAgent()` —— 主流程零改动。
 
-#### 7.3.2 预加载位置参数(70–97 行)
+#### 8.3.2 预加载位置参数(70–97 行)
 
 ```python
 def _prog(i, total, name, res):
@@ -1415,7 +1592,7 @@ for arg in sys.argv[1:]:
 
 `_prog` 是 `add_videos_from_dir` 的进度回调,这里就 print 一下。
 
-#### 7.3.3 REPL 主循环(101–172 行)
+#### 8.3.3 REPL 主循环(101–172 行)
 
 ```python
 while True:
@@ -1445,7 +1622,7 @@ while True:
 - 以 `/` 开头是命令,自己处理,**不发给 LLM**。
 - 否则发给 `agent.chat()`,把 LLM 最终回复打印出来。
 
-#### 7.3.4 斜杠命令处理(111–164 行)
+#### 8.3.4 斜杠命令处理(111–164 行)
 
 每个命令几行,写得直白:
 
@@ -1463,7 +1640,7 @@ while True:
 
 `cmd, *rest = user_input.split(maxsplit=1)` —— 解构赋值。`maxsplit=1` 只切一刀,所以路径里有空格也安全(只要整段当一个 token)。
 
-### 7.4 `if __name__ == "__main__"`(175–176 行)
+### 8.4 `if __name__ == "__main__"`(175–176 行)
 
 ```python
 if __name__ == "__main__":
@@ -1474,7 +1651,242 @@ if __name__ == "__main__":
 
 ---
 
-## 8. 数据/控制流总图
+## 9. evals/ — 行为回归测试
+
+不在根目录,在 `evals/` 子包下。这是把 agent 工程从「能跑」推到「敢改」的关键一步:**每一次改 system prompt / 换模型 / 加新工具,跑一条命令就能知道有没有让原来对的事变错。**
+
+### 9.1 一个 case 长啥样
+
+```jsonc
+{
+  "name": "01_filler_removal",
+  "description": "Single-video, remove rambling segments",
+  "setup": {
+    "videos": [
+      {
+        "video_id": "v1",
+        "transcript": {
+          "language": "en", "duration": 30,
+          "segments": [
+            {"id": 0, "start": 0,  "end": 4,  "text": "Today we're making pasta carbonara."},
+            {"id": 1, "start": 4,  "end": 8,  "text": "First, boil water."},
+            {"id": 2, "start": 8,  "end": 14, "text": "Um, hmm, where did I put the pancetta..."},
+            ...
+          ]
+        }
+      }
+    ]
+  },
+  "prompt": "Cut out the rambling and 'um' parts; keep just the cooking steps.",
+  "script": [
+    {"tool_calls": [{"name": "get_transcript", "arguments": {"video_id": "v1"}}]},
+    {"tool_calls": [{"name": "create_cut", "arguments": {"clips": [...]}}]},
+    {"content": "Done — kept 5 cooking steps..."}
+  ],
+  "checks": [
+    {"type": "tool_called", "tool": "get_transcript"},
+    {"type": "tool_not_called", "tool": "analyze_video_visuals"},
+    {"type": "kept_text_includes", "patterns": ["pasta", "pancetta"]},
+    {"type": "kept_text_excludes", "patterns": ["um", "hmm"]},
+    {"type": "duration_in", "min": 15, "max": 25}
+  ]
+}
+```
+
+四块:**setup**(假装把这些视频已经加进项目)+ **prompt**(用户输入)+ **script**(可选,offline 模式下逐步回放 LLM 的响应)+ **checks**(跑完之后要满足的断言)。
+
+### 9.2 三个核心模块
+
+**`scripted_client.py`** —— Drop-in 替换 `OpenAI()` 客户端,按 case 里的 `script` 数组返回固定响应。每次 `client.chat.completions.create(...)` 调用消耗一步。这让 offline 模式下整套流程**完全确定性**,不烧 token、不依赖网络。
+
+```python
+class ScriptedClient:
+    def __init__(self, script):  self._script = list(script);  self._index = 0
+    @property
+    def chat(self): ...    # 假装是 OpenAI 的 client.chat.completions.create
+    def _next(self, messages):
+        step = self._script[self._index]; self._index += 1
+        return _step_to_response(step, messages)   # 转成 OpenAI 形状的 Response
+```
+
+关键是 mock **接口形状**而不是行为 —— `OpenAI` SDK 用啥样的 `Response.choices[0].message.tool_calls[i].function.name`,Scripted 就提供啥样的 namespace 链。
+
+**`checks.py`** —— 一组 `(result) -> (passed: bool, msg: str)` 的小函数,通过 `CHECKS` 字典派发。每一种 check 类型(`tool_called` / `kept_text_includes` / `duration_in` ...)对应一个函数。新加 check 类型 = 写一个函数 + 在字典里注册。
+
+```python
+def check_tool_called(result, *, tool, min_count=1, max_count=None):
+    n = len(_calls_for(result, tool))
+    if n < min_count:     return False, f"{tool} called {n}× but needed ≥{min_count}"
+    return True, f"{tool} called {n}×"
+```
+
+入参的 `result: RunResult` 是个 dataclass,捆绑了 case 的所有可观察输出(final reply、tool call log、project 状态、token totals、agent error)。check 想看什么自己取。
+
+**`runner.py`** —— CLI 入口,组合上面两块。三件事:
+1. 读 `cases/*.json`,过滤(可选 `--case <name>`)
+2. 对每个 case:构造 Project(把 case.setup 里的 videos 注入)→ 创建 `VlogAgent` → 给它接上 `ScriptedClient`(offline 模式)或真 OpenAI 客户端 → 调 `agent.chat(prompt)` → 收集 tool log
+3. 对每个 check 跑一遍,打勾打叉,最后输出汇总
+
+### 9.3 dry_run_cuts —— 让 ffmpeg 不真跑
+
+`Project.dry_run_cuts: bool` 字段是为 evals 加的。当为 True 时,`create_cut` 走完所有 validation 后**不调 `editor.assemble`,直接返回一个 plan dict**(`{dry_run: true, would_output: ..., duration_sec: ..., clip_count: ..., clips: [...]}`)。
+
+为什么要这个?
+- ffmpeg 慢,evals 跑 50 个 case 不能等几分钟
+- ffmpeg 需要真实 mp4 文件,evals 用合成 transcript 没文件可读
+- ffmpeg 输出是字节流,断言起来很难。我们关心的是「LLM 挑了哪些时间段」,不是「编出来的 mp4 字节」
+
+dry_run 之后,所有 check 都基于 LLM 给的 `clips` 数组做判断 —— 这是 LLM 行为最有信息量的输出。
+
+### 9.4 依赖注入让 VlogAgent 可测
+
+为了让 evals 能塞 `ScriptedClient` 进去,`VlogAgent.__init__` 多了一个参数:
+
+```python
+def __init__(self, ..., client=None):
+    if client is not None:
+        self.client = client     # 测试 / eval 用
+    else:
+        api_key = os.getenv("LLM_API_KEY")
+        ...
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+```
+
+这是经典的依赖注入。**生产路径默认行为不变**,只是给测试开了个口子。一行简单的设计带来巨大的可测试性提升 —— 任何用真实外部依赖的类都该加这种 hook。
+
+### 9.5 Offline 还是 real LLM?
+
+| 模式 | 用法 | 用途 |
+|---|---|---|
+| `--offline` | `python -m evals.runner --offline` | CI 跑、harness 自检、改 case schema 时验证 runner 还好用 |
+| 真 LLM | `python -m evals.runner` | 改了 system prompt / 换了模型,看实际 LLM 行为是不是还过 check |
+
+两种模式跑的代码**几乎完全一样**(只是 client 不同),checks 通用。所以 offline 跑过 = harness 本身没坏;真 LLM 跑过 = 当前 prompt+模型组合在这些 case 上行为正确。
+
+### 9.6 这是 harness 第二根支柱
+
+跟之前的 `tracing.py` + `viewer.py` 形成互补:
+
+- **Tracing/Viewer**:看 LLM **实际**做了什么(可观察性)
+- **Evals**:断言 LLM **应该**做什么(可测试性)
+
+写一个新功能 → 用真 LLM 跑跑看 → 在 viewer 里观察行为 → 把好的行为固化成 eval case → 以后再改不会回退。这就是 LLM 工程的 TDD 节奏。
+
+---
+
+## 10. tests/ + CI — 让别人(和未来的你)敢改这套代码
+
+这一章不在某个 .py 文件里 —— 是 `tests/`、`pyproject.toml`、`requirements-dev.txt`、`.github/workflows/ci.yml` 这一组配置组合起来的成果。**没有这一层,前面所有的 harness 都只是「我写了功能」,有了这一层才是「这套代码经过自动化校验」。**
+
+### 10.1 三层检查
+
+每次 push 到 GitHub,CI 会跑三件事,任一失败 = 红勾 = 不允许 merge:
+
+```bash
+ruff check .                      # 1. 代码 lint
+pytest                            # 2. 纯函数单测
+python -m evals.runner --offline  # 3. 行为回归测试
+```
+
+为什么是这三层?
+- **lint** 抓低级错(未用的 import、语法变异、风格)。30 ms,几乎免费。
+- **pytest** 抓**业务函数**的退化(validators 算错了、JSON 解析器漏处理某种格式、ScriptedClient 的 namespace 链改坏了)。秒级。
+- **eval harness** 抓**LLM 行为**的退化(改 SYSTEM_PROMPT 之后,「去废话」的能力还在不?「reject-and-retry 之后能修对」还在不?)。10-30 秒。
+
+三个时间尺度,从「无脑快」到「全栈端到端」,一刀刀往下切问题。
+
+### 10.2 关键工程决定:CI 不装 PyTorch
+
+最大的一个工程权衡:**CI 只装 `requirements-dev.txt`,不装 `requirements.txt`**。
+
+requirements.txt 里有 `openai-whisper`,它会拉 PyTorch ~500 MB,CI 安装时间从 30 秒变成 5 分钟。但 offline evals + 单元测试都不真调 Whisper / OpenAI 网络,所以根本没必要装。
+
+让这个偷懒成立的关键就是「**懒加载**」(见 transcribe.py / agent.py / vision.py 内部):
+
+```python
+# transcribe.py
+def _load_model(name):
+    if name not in _MODEL_CACHE:
+        import whisper           # ← 真要用才 import
+        _MODEL_CACHE[name] = whisper.load_model(name)
+    return _MODEL_CACHE[name]
+```
+
+`import transcribe` 不会触发 whisper import。同理 `from openai import OpenAI` 被挪进 `VlogAgent.__init__` 里(只在没传 client 时才执行)。
+
+CI workflow 里有一道**专门的守卫**:
+
+```yaml
+- name: Verify lazy imports stay lazy
+  run: |
+    python -c "
+    import sys
+    import agent, evals.runner, vision, ...
+    forbidden = {'openai', 'whisper', 'torch'} & set(sys.modules)
+    if forbidden:
+        raise SystemExit(f'eager import: {forbidden}')
+    "
+```
+
+万一以后有人在某个文件顶部不小心写了 `import openai`,CI 立刻红。**这是「设计意图固化成自动化检查」的小例子,本质和 eval 是一回事。**
+
+### 10.3 tests/ 的取舍
+
+```
+tests/
+├── conftest.py              # 把项目根加到 sys.path,pytest 才能 import agent
+├── test_validators.py       # 18 个 case 覆盖 sanity + goal 检查
+├── test_vision_parsing.py   # 7 种 vision LLM 输出格式扰动
+└── test_scripted_client.py  # 7 个 case 覆盖 mock client 的 OpenAI 形状
+```
+
+只测**纯函数**和**关键 mock**。原因:
+- 测纯函数最便宜、最稳定、最有信号
+- 测 LLM 行为已经有 evals harness,不重复劳动
+- 测 ffmpeg 输出是噩梦(字节级断言、要 fixture 视频),性价比低
+
+**故意不测的东西**:`agent.chat()` 的整个循环、`Project.create_cut()` 的 ffmpeg 路径、`tracing.Tracer` 的 IO。这些更适合 evals 来兜底。
+
+### 10.4 pyproject.toml 哲学
+
+ruff 规则**起步严格度刻意低**:只开 E/F/W/I/B/UP 这几组,而且 ignore 了 E501(行宽超限)和 B008(默认值是函数调用)。
+
+为什么?**让 CI 第一次绿很重要**。一开始就 `select = ["ALL"]` 然后挂掉 800 个错,会逼你要么花一天扫地、要么 ignore 一堆规则把 lint 变成形同虚设。
+
+**起步宽松、慢慢收紧**比反过来好得多。每加一组新规则、修完几个新警告,代码质量阶梯式上升。
+
+```toml
+[tool.ruff.lint]
+select = ["E","F","W","I","B","UP"]
+ignore = ["E501","B008"]
+```
+
+### 10.5 依赖注入让测试可行
+
+注意 `VlogAgent.__init__` 多了个看似没必要的 `client=None` 参数:
+
+```python
+def __init__(self, ..., client=None):
+    if client is not None:
+        self.client = client          # tests / evals 用
+    else:
+        from openai import OpenAI
+        self.client = OpenAI(...)     # 生产用
+```
+
+**生产路径行为完全不变**(默认 None,走原来的 OpenAI 客户端),但给 evals 和测试开了个口子让它们能塞 ScriptedClient 进去。
+
+这是经典的依赖注入 + 默认值模式。**任何用真实外部依赖(数据库、HTTP client、文件系统)的类都该考虑加这个 hook**,代价几乎为零,可测试性提升一档。
+
+### 10.6 这一层的元价值
+
+回过头看,tests + CI 加进来,**项目从「我能跑」升级到了「别人接手也敢改」**。可以把项目放到简历上、给同事看、找贡献者。
+
+更重要的是,**改起来心理负担小了**:你想改 SYSTEM_PROMPT?改完跑一下 `pytest && python -m evals.runner --offline`,绿了就放心 commit。不绿就先看 viewer 里实际发生了什么,有针对性地改。**这就是 harness 工程的复利:每加一个测试,未来每次改动都更安全一点。**
+
+---
+
+## 11. 数据/控制流总图
 
 把上面所有东西串起来,以「用户说『把 v1 精华部分留下』」为例。**右边一栏标了 Tracer 在每一步记录什么**,这样你能直接对照 viewer 里看到的内容:
 
@@ -1538,7 +1950,7 @@ if __name__ == "__main__":
 
 ---
 
-## 9. 学习路径建议
+## 12. 学习路径建议
 
 如果你想吃透这套代码,建议按这个顺序:
 
@@ -1563,7 +1975,7 @@ if __name__ == "__main__":
 
 ---
 
-## 10. 几个常被问到的「为什么」
+## 13. 几个常被问到的「为什么」
 
 **Q: 为什么 Whisper 跑在本地,LLM 跑在云端?**
 A: Whisper 是开源、单次推理在 CPU 几秒到几十秒就完;LLM 自己跑要 GPU + 几十 GB 显存,不现实。Whisper 的输出又是离散的文本,云端 LLM 处理 token 不耗带宽。这是最经济的分工。

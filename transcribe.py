@@ -15,12 +15,10 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-import whisper
-
 WORKSPACE = Path(__file__).parent / "workspace"
 WORKSPACE.mkdir(exist_ok=True)
 
-_MODEL_CACHE: dict[str, "whisper.Whisper"] = {}
+_MODEL_CACHE: dict = {}
 
 
 def _file_fingerprint(path: Path) -> str:
@@ -53,8 +51,11 @@ def _extract_audio(video_path: Path, audio_path: Path) -> None:
         raise RuntimeError(f"ffmpeg audio extraction failed:\n{result.stderr}")
 
 
-def _load_model(name: str) -> "whisper.Whisper":
+def _load_model(name: str):
+    """Lazy import + cache. Whisper pulls in PyTorch (~500 MB), so we
+    only import when an actual transcription is requested."""
     if name not in _MODEL_CACHE:
+        import whisper   # local import keeps `import transcribe` cheap
         _MODEL_CACHE[name] = whisper.load_model(name)
     return _MODEL_CACHE[name]
 

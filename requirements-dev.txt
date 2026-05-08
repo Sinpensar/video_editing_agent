@@ -1,0 +1,7 @@
+# Dev / CI deps. Install on top of requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
+# CI itself only needs this file (offline evals don't need openai/whisper).
+ruff>=0.6.0
+pytest>=8.0
+pytest-cov>=5.0
+python-dotenv>=1.0

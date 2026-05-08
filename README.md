@@ -1,5 +1,8 @@
 # VlogAgent
 
+<!-- Once you push to GitHub, replace OWNER/REPO below with your actual path. -->
+[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+
 A conversational vlog editor.
 You hand it raw footage, tell it what you want, and it transcribes the audio, decides what to keep, and runs FFmpeg to spit a finished cut into `output/`.
 
@@ -89,18 +92,87 @@ agent ▸ Built a 3:02 cut from 18 food moments across 14 of your 23 clips.
 
 ```
 vlog_agent/
-├── main.py          # CLI entry point
-├── agent.py         # VlogAgent + LLM function-calling loop
-├── transcribe.py    # Whisper transcription (with file-fingerprint cache)
-├── editor.py        # FFmpeg cut + concat
-├── validators.py    # Pre-flight checks before ffmpeg runs (reject-and-retry)
-├── tracing.py       # Tracer — dumps every conversation turn to JSON
-├── viewer.py        # Builds a self-contained HTML viewer for traces
-├── workspace/       # Transcript cache (auto-created)
-├── output/          # Finished cuts (auto-created)
-├── traces/          # Conversation traces (auto-created, one folder per session)
-└── requirements.txt
+├── main.py              # CLI entry point
+├── agent.py             # VlogAgent + LLM function-calling loop
+├── transcribe.py        # Whisper transcription (with file-fingerprint cache)
+├── vision.py            # Frame-level visual tagging via GLM-4V-Flash (cached)
+├── editor.py            # FFmpeg cut + concat
+├── validators.py        # Pre-flight checks before ffmpeg runs (reject-and-retry)
+├── tracing.py           # Tracer — dumps every conversation turn to JSON
+├── viewer.py            # Builds a self-contained HTML viewer for traces
+├── evals/               # Behavioral regression tests (offline + real-LLM)
+├── tests/               # pytest unit tests for pure functions
+├── .github/workflows/   # CI: ruff + pytest + offline evals
+├── pyproject.toml       # ruff / pytest config + project metadata
+├── requirements.txt     # Runtime deps
+├── requirements-dev.txt # Dev / CI deps
+├── workspace/           # Transcript + visuals cache (auto-created)
+├── output/              # Finished cuts (auto-created)
+└── traces/              # Conversation traces (auto-created, one folder per session)
 ```
+
+## Vision (optional)
+
+For goals that depend on what was *shown* rather than what was *said* —
+scenery, food, faces, animals, action shots — the agent can analyze frames
+via GLM-4V-Flash (free) and tag each one with subject / scene / action /
+interest score. Tell it in chat:
+
+```
+you ▸ Make a 1-minute travel highlight, pick the most cinematic shots.
+  ✓ analyze_video_visuals(video_id=v1)        ← 30 frames analyzed, ~45s
+  ✓ search_visuals(query=scenery)             ← 12 high-interest frames
+  ✓ create_cut(clips=[8 cinematic moments])   ← rendered to output/
+```
+
+Vision analysis runs only when you ask for it — `add_video` stays cheap.
+Results are cached to `workspace/`, so re-running on the same video is
+instant. Cap how many frames are sampled with `VISION_MAX_FRAMES` in
+`.env` (default 30, capping first-run time at 30–60 seconds per video).
+
+## Development & CI
+
+Three layers of automated checks run in CI on every push (see
+`.github/workflows/ci.yml`):
+
+```bash
+pip install -r requirements-dev.txt   # ruff + pytest
+
+ruff check .                          # lint
+pytest                                # unit tests for pure functions
+python -m evals.runner --offline      # behavioral regression tests
+```
+
+CI does **not** install `requirements.txt` — `agent.py`, `vision.py`,
+and `transcribe.py` lazy-import `openai` and `whisper`, so the test
+matrix runs in ~30 s instead of pulling PyTorch (≈500 MB) every time.
+A dedicated CI step verifies the lazy-import invariant stays intact.
+
+The Python matrix tests on 3.10 / 3.11 / 3.12.
+
+## Eval harness
+
+The `evals/` directory holds behavioral regression tests — each case
+declares a synthetic project setup, a user prompt, and a list of
+assertions the resulting agent run must satisfy.
+
+```bash
+# Deterministic offline run (no API tokens spent, uses scripted LLM responses):
+python -m evals.runner --offline
+
+# Real LLM run (uses your .env's LLM_API_KEY):
+python -m evals.runner
+```
+
+Each case asserts things like *"the agent must call set_goal with
+target_duration_sec=30"*, *"final clips must include the word 'espresso'
+but not 'weather'"*, *"total duration in [25, 35] seconds"*, *"agent
+must not call analyze_video_visuals"*. Tweak the system prompt or
+switch models, run the suite, and you get an objective pass/fail
+report instead of vibing it.
+
+See `evals/README.md` for the case format and the catalog of available
+checks.
 
 ## Validation & self-correction
 

@@ -27,17 +27,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
-from openai import OpenAI
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass   # dotenv is optional; .env will just be ignored if missing
 
 import editor
 import transcribe
 import validators
+import vision
 
 if TYPE_CHECKING:
     from tracing import Tracer
-
-load_dotenv()
 
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "glm-4-flash")
 DEFAULT_BASE_URL = os.getenv(
@@ -53,8 +55,16 @@ You can handle anywhere from a single clip to dozens of clips at once. The avail
 - `list_videos` — see what's loaded, with a short snippet of each
 - `get_transcript(video_id)` — full timestamped transcript of one video
 - `search_segments(query, video_ids?)` — find every mention of a keyword across all (or selected) videos
+- `analyze_video_visuals(video_id)` — opt-in: sample frames and tag each one (subject, scene, interest, etc.). Slow on first run. Required before search_visuals/get_visuals can return data.
+- `search_visuals(query, video_ids?)` — find every frame matching a visual keyword across analyzed videos
+- `get_visuals(video_id)` — full per-frame visual tags
 - `set_goal(...)` — register the user's editing target (length, keywords, clip count). Validators use this.
 - `create_cut(clips, output_filename?)` — splice (video_id, start, end) tuples into one mp4
+
+Speech vs vision — choose the right perception tool:
+- If the user's goal is content-based (what was SAID) — coffee, cooking steps, jokes, story arc — use the transcript tools (get_transcript, search_segments). Free and fast.
+- If the goal is visual (what was SHOWN) — scenery, action, faces, animals, outfits — call analyze_video_visuals first, then search_visuals / get_visuals. This is slow, so warn the user before kicking it off, and only do it for videos you actually need.
+- For mixed goals, transcripts are usually enough; only escalate to visuals when the transcript misses something important (e.g. silent stretches with interesting footage).
 
 Workflow for a single video:
 1. If the user mentioned a target length, required topics, or things to avoid, call `set_goal(...)` first.
@@ -239,6 +249,63 @@ TOOLS: list[dict[str, Any]] = [
         },
     ),
     _function(
+        "analyze_video_visuals",
+        "Run vision analysis on one registered video — extract sampled "
+        "frames and tag each with subject, scene, action, interest score, "
+        "tags, and a short caption. Cached on disk, so re-running on the "
+        "same file is free. Required before search_visuals or get_visuals "
+        "can return data for that video. SLOW: 30-60s per video on first "
+        "run; warn the user.",
+        {
+            "type": "object",
+            "properties": {
+                "video_id": {"type": "string"},
+                "max_frames": {
+                    "type": "integer",
+                    "description": "Cap on sampled frames (default 30)."
+                },
+            },
+            "required": ["video_id"],
+        },
+    ),
+    _function(
+        "search_visuals",
+        "Substring search (case-insensitive) across the visual tags of "
+        "loaded videos. Use this for goals that depend on what the camera "
+        "saw rather than what was said — e.g. 'find every scenic landscape "
+        "shot', 'find frames with food'. Returns matching frames with "
+        "video_id + timestamp + tags. Will skip videos that haven't been "
+        "analyzed yet (returned in not_analyzed_video_ids).",
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "video_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of video_ids to limit "
+                                   "the search. Omit to search all.",
+                },
+                "max_results": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    ),
+    _function(
+        "get_visuals",
+        "Return the full per-frame visual analysis for one video "
+        "(after analyze_video_visuals has been run). Each frame includes "
+        "id, time (seconds), and tags {subject, scene, action, interest, "
+        "tags, note}.",
+        {
+            "type": "object",
+            "properties": {
+                "video_id": {"type": "string"},
+            },
+            "required": ["video_id"],
+        },
+    ),
+    _function(
         "set_goal",
         "Register or update the user's editing goal. Validators use this "
         "when checking each create_cut. Call this near the start of a "
@@ -306,6 +373,8 @@ class Project:
     videos: dict[str, VideoEntry] = field(default_factory=dict)
     # User-declared editing goal — used by validators. None until set_goal.
     goal: dict = field(default_factory=dict)
+    # video_id → output of vision.analyze_visuals(). Populated lazily.
+    visuals: dict[str, dict] = field(default_factory=dict)
 
     def next_id(self) -> str:
         return f"v{len(self.videos) + 1}"
@@ -511,12 +580,120 @@ class Project:
             "skipped": skipped,
         }
 
+    # -- vision -----------------------------------------------------------
+
+    def analyze_visuals(
+        self,
+        video_id: str,
+        *,
+        max_frames: int | None = None,
+        force: bool = False,
+        client: Any = None,
+    ) -> dict:
+        """Run vision.analyze_visuals on a registered video and store the
+        result in self.visuals[video_id]. Returns a compact summary."""
+        entry = self.videos.get(video_id)
+        if not entry:
+            return {"error": f"No such video_id: {video_id}. "
+                             f"Known: {list(self.videos)}"}
+        try:
+            kwargs: dict = {"force": force}
+            if max_frames is not None:
+                kwargs["max_frames"] = int(max_frames)
+            if client is not None:
+                kwargs["client"] = client
+            result = vision.analyze_visuals(entry.path, **kwargs)
+        except Exception as e:
+            return {"error": f"Vision analysis failed: {e}"}
+
+        self.visuals[video_id] = result
+        return {
+            "video_id": video_id,
+            "filename": entry.path.name,
+            "model": result.get("model"),
+            "frame_count": result.get("frame_count"),
+            "sample_fps": result.get("sample_fps"),
+        }
+
+    def get_visuals(self, video_id: str) -> dict:
+        entry = self.videos.get(video_id)
+        if not entry:
+            return {"error": f"No such video_id: {video_id}"}
+        v = self.visuals.get(video_id)
+        if not v:
+            return {
+                "error": f"Visuals not analyzed yet for {video_id}. "
+                         f"Call analyze_video_visuals first."
+            }
+        return {
+            "video_id": video_id,
+            "filename": entry.path.name,
+            "model": v.get("model"),
+            "frame_count": v.get("frame_count"),
+            "frames": v.get("frames", []),
+        }
+
+    def search_visuals(
+        self,
+        query: str,
+        video_ids: list[str] | None = None,
+        max_results: int = 30,
+    ) -> dict:
+        """Substring search across the visual tags of one, several, or all
+        analyzed videos. Returns matching frames with video_id + timestamp."""
+        if not query or not query.strip():
+            return {"error": "Empty query."}
+        q = query.strip().lower()
+
+        if video_ids:
+            unknown = [v for v in video_ids if v not in self.videos]
+            if unknown:
+                return {"error": f"Unknown video_id(s): {unknown}"}
+            target_ids = video_ids
+        else:
+            target_ids = list(self.videos.keys())
+
+        not_analyzed = [vid for vid in target_ids if vid not in self.visuals]
+        hits: list[dict] = []
+        for vid in target_ids:
+            v = self.visuals.get(vid)
+            if not v:
+                continue
+            entry = self.videos[vid]
+            for frame in v.get("frames", []):
+                text = vision.frame_search_text(frame)
+                if q in text:
+                    hits.append({
+                        "video_id": vid,
+                        "filename": entry.path.name,
+                        "frame_id": frame.get("id"),
+                        "time": frame.get("time"),
+                        "tags": frame.get("tags"),
+                    })
+                    if len(hits) >= max_results:
+                        break
+            if len(hits) >= max_results:
+                break
+
+        return {
+            "query": query,
+            "total_matches": len(hits),
+            "truncated": len(hits) >= max_results,
+            "matches": hits,
+            "not_analyzed_video_ids": not_analyzed,
+        }
+
+    # When True, all create_cut calls validate but skip ffmpeg. Used by
+    # the eval harness to check planning behavior without burning compute.
+    dry_run_cuts: bool = field(default=False)
+
     def create_cut(
         self,
         clips: list[dict],
         output_filename: str | None,
         *,
         force: bool = False,
+        dry_run: bool = False,
     ) -> dict:
         # ---- pre-flight validation -------------------------------------
         issues = validators.validate_clips(clips, self, goal=self.goal)
@@ -542,12 +719,24 @@ class Project:
                 "end": float(c["end"]),
             })
 
+        total = sum(c["end"] - c["start"] for c in resolved)
+
+        # If dry_run is on (per-call or project-wide), skip ffmpeg.
+        if dry_run or self.dry_run_cuts:
+            return {
+                "dry_run": True,
+                "would_output": output_filename or "vlog_<auto>.mp4",
+                "duration_sec": round(total, 2),
+                "clip_count": len(resolved),
+                "clips": resolved,
+                "warnings": issues if issues and force else None,
+            }
+
         try:
             out_path = editor.assemble(resolved, output_filename=output_filename)
         except Exception as e:
             return {"error": f"Assembly failed: {e}"}
 
-        total = sum(c["end"] - c["start"] for c in resolved)
         return {
             "output_path": str(out_path),
             "view_link": f"computer://{out_path}",
@@ -564,13 +753,18 @@ class VlogAgent:
         base_url: str = DEFAULT_BASE_URL,
         max_tool_iters: int = 10,
         tracer: "Optional[Tracer]" = None,
+        client: Any = None,    # injectable for tests / eval harness
     ):
-        api_key = os.getenv("LLM_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "LLM_API_KEY not set. Copy .env.example to .env and fill it in."
-            )
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        if client is not None:
+            self.client = client
+        else:
+            api_key = os.getenv("LLM_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "LLM_API_KEY not set. Copy .env.example to .env and fill it in."
+                )
+            from openai import OpenAI   # lazy: keeps `import agent` openai-free
+            self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.max_tool_iters = max_tool_iters
         self.project = Project()
@@ -604,9 +798,12 @@ class VlogAgent:
             for v in videos:
                 dur = v.get("duration_sec") or 0
                 snippet = (v.get("snippet") or "").strip()
+                vis = self.project.visuals.get(v["video_id"])
+                vis_tag = (f"visuals: {vis.get('frame_count')} frames analyzed"
+                           if vis else "visuals: not analyzed")
                 lines.append(
                     f"- {v['video_id']} | {v['filename']} | "
-                    f"{dur:.1f}s | {v['segment_count']} segs | lang={v.get('language')}"
+                    f"{dur:.1f}s | {v['segment_count']} segs | lang={v.get('language')} | {vis_tag}"
                 )
                 if snippet:
                     lines.append(f"    snippet: {snippet}")
@@ -647,6 +844,19 @@ class VlogAgent:
                 if k in {"target_duration_sec", "min_clips", "max_clips",
                          "must_include_keywords", "must_exclude_keywords"}
             })
+        if name == "analyze_video_visuals":
+            return self.project.analyze_visuals(
+                args["video_id"],
+                max_frames=args.get("max_frames"),
+            )
+        if name == "search_visuals":
+            return self.project.search_visuals(
+                args["query"],
+                video_ids=args.get("video_ids"),
+                max_results=int(args.get("max_results", 30)),
+            )
+        if name == "get_visuals":
+            return self.project.get_visuals(args["video_id"])
         return {"error": f"Unknown tool: {name}"}
 
     # -- single user turn ---------------------------------------------------

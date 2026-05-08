@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:   # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel older runs of the same branch when a new commit lands.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + tests + offline evals (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+
+      # We deliberately do NOT install requirements.txt here. The eval
+      # harness's offline mode (and our pytest tests) rely on lazy imports
+      # of openai/whisper, so heavy deps like PyTorch never get pulled in.
+      # CI stays fast (~30s instead of 5+ min) and reliable.
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Verify lazy imports stay lazy
+        # If anyone accidentally adds `import openai` at module top-level
+        # again, this catches it before CI green-lights the change.
+        run: |
+          python -c "
+          import sys
+          import agent, evals.runner, evals.scripted_client, validators, vision, tracing
+          forbidden = {'openai', 'whisper', 'torch'} & set(sys.modules)
+          if forbidden:
+              raise SystemExit(f'eager import of heavy deps detected: {forbidden}')
+          print('OK: lazy imports preserved')
+          "
+
+      - name: Run unit tests
+        run: pytest -ra
+
+      - name: Run offline eval harness
+        env:
+          # The offline path doesn't actually call the LLM, but agent.py's
+          # __init__ guard rails check for it being set.
+          LLM_API_KEY: stub-for-offline-evals
+        run: python -m evals.runner --offline

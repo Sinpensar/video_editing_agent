@@ -1,0 +1,46 @@
+[project]
+name = "vlog-agent"
+version = "0.4.0"
+description = "Conversational vlog editor — LLM + Whisper + FFmpeg, with traces, validators, evals."
+requires-python = ">=3.10"
+
+# Runtime deps live in requirements.txt for now (kept simple for users
+# who just want to clone-and-run). Dev / CI deps in requirements-dev.txt.
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["venv", "workspace", "output", "traces", ".git"]
+
+[tool.ruff.lint]
+# Start permissive: only the no-brainers. Tighten over time.
+select = [
+  "E",      # pycodestyle errors
+  "F",      # pyflakes (unused imports, undefined names)
+  "W",      # pycodestyle warnings
+  "I",      # isort (import sorting)
+  "B",      # flake8-bugbear (likely bugs)
+  "UP",     # pyupgrade (modern syntax)
+]
+ignore = [
+  "E501",   # line too long — handled by formatter, complaining is noise
+  "B008",   # function calls in defaults — fine for our config helpers
+]
+
+[tool.ruff.lint.per-file-ignores]
+"evals/cases/*" = ["E"]   # JSON, not Python — but in case anyone slips a .py
+"tests/*"       = ["E501", "F401"]  # tests can be relaxed
+
+[tool.ruff.format]
+# We mostly care about lint. Format-on-save is fine if you opt in.
+quote-style = "preserve"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+  "-ra",            # show short summary for everything except passes
+  "--strict-markers",
+]

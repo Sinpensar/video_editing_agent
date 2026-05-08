@@ -1,0 +1,60 @@
+{
+  "name": "01_filler_removal",
+  "description": "Single-video, remove rambling segments; verify agent reads transcript and picks substantive parts.",
+  "setup": {
+    "videos": [
+      {
+        "video_id": "v1",
+        "path": "/tmp/eval_cooking.mp4",
+        "transcript": {
+          "language": "en",
+          "duration": 30.0,
+          "segments": [
+            {"id": 0, "start": 0.0,  "end": 4.0,  "text": "Today we're going to make pasta carbonara."},
+            {"id": 1, "start": 4.0,  "end": 8.0,  "text": "First, get a large pot of water boiling."},
+            {"id": 2, "start": 8.0,  "end": 14.0, "text": "Um, hmm, where did I put the pancetta..."},
+            {"id": 3, "start": 14.0, "end": 18.0, "text": "OK, found it. We dice the pancetta into small cubes."},
+            {"id": 4, "start": 18.0, "end": 22.0, "text": "And, uh, you know, just like, ramble for a bit."},
+            {"id": 5, "start": 22.0, "end": 26.0, "text": "Now we crisp the pancetta in a hot pan."},
+            {"id": 6, "start": 26.0, "end": 30.0, "text": "Finally, toss everything with the pasta and serve."}
+          ]
+        }
+      }
+    ]
+  },
+  "prompt": "Cut out the rambling and 'um' parts; keep just the cooking steps.",
+  "script": [
+    {
+      "tool_calls": [
+        {"name": "get_transcript", "arguments": {"video_id": "v1"}}
+      ]
+    },
+    {
+      "tool_calls": [
+        {"name": "create_cut", "arguments": {
+          "clips": [
+            {"video_id": "v1", "start": 0.0,  "end": 4.0,  "note": "intro"},
+            {"video_id": "v1", "start": 4.0,  "end": 8.0,  "note": "boil water"},
+            {"video_id": "v1", "start": 14.0, "end": 18.0, "note": "dice pancetta"},
+            {"video_id": "v1", "start": 22.0, "end": 26.0, "note": "crisp pancetta"},
+            {"video_id": "v1", "start": 26.0, "end": 30.0, "note": "serve"}
+          ]
+        }}
+      ]
+    },
+    {
+      "content": "Done — kept 5 cooking steps, dropped the rambling. Total ~20s. Output saved."
+    }
+  ],
+  "checks": [
+    {"type": "no_agent_error"},
+    {"type": "tool_called", "tool": "get_transcript"},
+    {"type": "tool_called", "tool": "create_cut"},
+    {"type": "tool_not_called", "tool": "analyze_video_visuals"},
+    {"type": "no_validation_failures"},
+    {"type": "kept_text_includes", "patterns": ["pasta", "pancetta", "boiling"]},
+    {"type": "kept_text_excludes", "patterns": ["um", "hmm", "ramble"]},
+    {"type": "duration_in", "min": 15, "max": 25},
+    {"type": "clip_count", "min": 4, "max": 7}
+  ]
+}
