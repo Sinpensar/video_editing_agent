@@ -1,7 +1,9 @@
 # VlogAgent
 
 <!-- Once you push to GitHub, replace OWNER/REPO below with your actual path. -->
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/Sinpensar/video_editing_agent
+/actions/workflows/ci.yml/badge.svg)](https://github.com/Sinpensar/video_editing_agent
+/actions/workflows/ci.yml)
 
 A conversational vlog editor.
 You hand it raw footage, tell it what you want, and it transcribes the audio, decides what to keep, and runs FFmpeg to spit a finished cut into `output/`.
